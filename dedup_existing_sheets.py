@@ -7,9 +7,9 @@ This tool retroactively cleans past sheets by removing jobs that already appeare
 in an earlier run's sheet.
 
 Usage:
-    python3 dedup_existing_sheets.py              # clean all sheets (oldest kept, newest deduped)
-    python3 dedup_existing_sheets.py --dry-run    # report only, no changes
-    python3 dedup_existing_sheets.py --from 2026-08-15  # only clean sheets from this date onward
+    python dedup_existing_sheets.py              # clean all sheets (oldest kept, newest deduped)
+    python dedup_existing_sheets.py --dry-run    # report only, no changes
+    python dedup_existing_sheets.py --from 2026-08-15  # only clean sheets from this date onward
 
 Strategy:
   - Exact URL identity via the shared normalize_job_url() across all older exports.
@@ -28,7 +28,7 @@ from datetime import datetime
 
 from job_identity import normalize_job_url
 
-JOB_SEARCH_DIR = Path("/home/sagar/Skills/Jobscraper/Job Search")
+from config import JOB_SEARCH_DIR
 
 FIELDNAMES = ["language", "job_board", "role_type", "title", "company", "location",
               "posted_at", "exp_required", "match_score", "job_url"]
@@ -63,8 +63,8 @@ def rewrite_md(md_path: Path, jobs: list[dict], now_str: str) -> None:
 ## Constraints Summary
 - **Freshness:** Last 24 Hours
 - **Experience:** <= 2 Years (No Senior/Lead/Manager roles)
-- **Role Types:** Full-Time & Internships (Germany-wide) | Working Student (**Hamburg & Kiel ONLY**)
-- **Target Roles:** Data Engineer, Analytics Engineer, Data Analyst, AI Data Engineer
+- **Role Types:** Full-Time, Working Student and Internship (all Germany-wide)
+- **Target Roles:** Plant science, hydroponics / CEA, laboratory, food safety & quality
 
 | # | Language | Job Board | Role Type | Company | Job Title | Location | Match | Direct Link |
 |---|---|---|---|---|---|---|---|---|

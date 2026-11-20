@@ -1,64 +1,62 @@
 # Architecture
 
-Technical details for the Jobscraper pipeline and verification post-step.
+Technical details for the Jobscraper pipeline and verification post-step. Windows + Claude Desktop only.
 
 ## Pipeline Flow
 
 ```mermaid
 graph TD
-    A[8 platform fetchers in parallel] --> B[title + seniority filters]
-    B --> C[shared Germany location policy]
+    A[6 source fetchers in parallel] --> B[title relevance + seniority filters]
+    B --> C[Germany location policy]
     C --> D[within-run company/title dedup]
     D --> E[all-prior dated-export exact URL dedup]
     E --> F[CSV + JSON + MD + XLSX export]
-    F --> G[verification Germany/history boundary]
-    G --> H[platform checks + final full JD]
-    H --> I[OMP typed judge_batch]
-    I --> J[review and output-sheet routing]
+    F --> G[verify prepare: Germany/history boundary]
+    G --> H[platform checks + TinyFish/Jina description fallback]
+    H --> I[judge + applied-check batch files]
+    I --> J[Claude Desktop Haiku 5.5 subagents]
+    J --> K[verify finalize: routing + verified workbook]
 ```
 
-The scraper and ATS fetchers use one conservative Germany policy. Verification
-repeats the location and working-student checks before any output-sheet routing.
-Exact URLs seen in earlier dated exports are filtered before verification
-requests or JD judgment. Same-day scrape reruns preserve only eligible existing
-rows that are not already present in earlier history.
+Candidate-specific settings (titles, filters, skill keywords, paths) live in
+`config.py`; every other module imports from it. The fetchers run together via
+`ThreadPoolExecutor`; each is independent and results are collected at the end.
 
-All 8 platform fetchers run simultaneously via `ThreadPoolExecutor(max_workers=8)`.
-Each fetcher is independent; results are collected after all complete.
+Windows details: `config.py` forces a UTF-8 console, all file I/O names its
+encoding, and scratch batches live in `.work\` next to the code (no `/tmp`, no
+hard-coded home directories).
 
 ## Filter Chain
 
 Every scraped job passes through `check_experience_and_location()`; ATS results
-use the same location helpers:
+use the same helpers from `config.py` and `location_policy.py`:
 
-1. **Title relevance** (`is_relevant_title`) — rejects titles with no
-   data/analytics/AI/SQL/Python keyword.
-2. **Seniority ceiling** — rejects senior, lead, principal, staff, manager,
+1. **Title relevance** (`config.is_relevant_title`) - needs a plant / lab /
+   food-safety / horticulture keyword and no software or unrelated-trade marker.
+2. **Seniority ceiling** - rejects senior, lead, principal, staff, manager,
    head, architect, and director titles. Required experience years are judged
-   from the full description during verification.
-3. **Germany location evidence** — requires Germany/Deutschland, a structured
+   from the full description by Haiku during verification.
+3. **Germany location evidence** - requires Germany/Deutschland, a structured
    `DE` country segment, a German state, or an unambiguous German city. Unknown,
    blank, and remote-region-only locations are not treated as Germany.
-4. **Working-student city restriction** — Working Student roles require
-   Hamburg or Kiel; other eligible role types may be Germany-wide.
+4. **Role type** - Working Student, Internship or Full-Time / Entry-Level. All
+   three are Germany-wide.
 
-`verify_jobs.py` enforces the same location policy at the start of verification,
-so foreign/unknown rows from older inputs never appear in any output sheet.
+`verify_jobs.py prepare` applies the same location policy before any routing, so
+foreign/unknown rows from older inputs never appear in any output sheet.
 
-## Freshness Filtering (24h, all 8 platforms)
+## Freshness Filtering (24h)
 
 | Platform | Server-side filter | Post-filter | No-date behavior |
 |---|---|---|---|
-| Arbeitnow | — | `created_at` vs 24h cutoff | N/A (API always has timestamp) |
-| Xing | — | `<time dateTime>` vs cutoff | Include (sponsored listings are real jobs) |
+| Arbeitnow | - | `created_at` vs 24h cutoff | N/A (API always has timestamp) |
+| Xing | - | `<time dateTime>` vs cutoff | Include (sponsored listings are real jobs) |
 | Stepstone | `ag=age_1` (24h) | `parse_stepstone_timeago()` vs cutoff | Include (defaults to now) |
 | LinkedIn | `f_TPR=r86400` (24h) | `posted_at` datetime vs cutoff | Include (safety net only) |
 | Indeed | GraphQL `dateOnIndeed` with `start: "24h"` | `dateOnIndeed` or `datePublished` vs cutoff | Include when no timestamp is available |
-| Wellfound | — | `_parse_wellfound_date()` relative date vs cutoff | Include (no date = "Last 24h") |
-| EU Remote Jobs | `after` param (ISO datetime) | `date` field vs cutoff | N/A (API always has timestamp) |
-| ATS: Greenhouse | — | `first_published` vs cutoff | Include (via `_is_fresh`) |
-| ATS: SmartRecruiters | — | `releasedDate` vs cutoff | Include (via `_is_fresh`) |
-| ATS: Ashby | — | `publishedDate` vs cutoff | Include (via `_is_fresh`) |
+| ATS: Greenhouse | - | `first_published` vs cutoff | Include (via `_is_fresh`) |
+| ATS: SmartRecruiters | - | `releasedDate` vs cutoff | Include (via `_is_fresh`) |
+| ATS: Ashby | - | `publishedDate` vs cutoff | Include (via `_is_fresh`) |
 
 ## Deduplication
 
@@ -76,128 +74,140 @@ same Germany and historical-URL checks. Historical outputs are never rewritten.
 
 ## Verification Post-Step
 
-### Eligibility, acquisition, and typed judgment
+Verification is a three-phase hand-off because the judge is Claude Haiku 5.5
+running as Claude Desktop subagents:
 
-`run_verification()` first filters foreign/unknown locations and working-student
-roles outside Hamburg/Kiel. Germany-eligible rows whose exact URL appears in
-an earlier dated export are sent to **Previously Seen** without platform
-requests or JD judgment. Only remaining rows proceed.
+1. `python verify_jobs.py prepare`
+2. Haiku subagents (SKILL.md Step 3) read batch files and write result files
+3. `python verify_jobs.py finalize`
 
-The verifier injects descriptions from the sibling JSON, checks platform
-status, then merges any longer description acquired during verification. The
-judge receives the final full description; it does not use regex-selected or
-truncated excerpts.
+### Prepare
 
-The verification entry point is async and requires OMP eval's `judge_batch`.
-It submits independent typed choices for German requirement and required
-experience in one bounded-concurrency batch:
+`prepare_verification()` removes foreign/unknown locations, sends rows whose
+exact URL appears in an earlier dated export to **Previously Seen** (no platform
+requests, no judging), injects descriptions from the sibling JSON, runs the
+platform verifiers, detects LinkedIn reposts, and then
+`acquire_missing_descriptions()` fetches still-missing descriptions via
+TinyFish and then Jina Reader (`fetchers.py`). It writes:
 
-- German: required C1/C2, fluent/fließend, native/Muttersprache,
-  verhandlungssicher, or standalone *sehr gute Deutschkenntnisse* maps to
-  `German C1+ required`; B1/B2 is allowed; preferred German maps to
-  `German preferred`. *Sehr gute Deutsch- und Englischkenntnisse* stays in the
-  allowed B1/B2 category unless C1+ is explicit.
-- Experience: use the lower bound of required ranges (0–2 → minimum 0,
-  1–3 → minimum 1, 3–5 → minimum 3); optional/preferred years do not
-  disqualify. Required *mehrjährige Erfahrung* / several years is >2.
-- Missing/insufficient descriptions, failed judgments, and invalid typed
-  answers are marked **Needs Review**; no permissive defaults can qualify a row.
+- `.work\judge\batch_NNN.json` - `JUDGE_BATCH_SIZE` (5) jobs with full descriptions
+- `.work\judge\judge_instructions.md` - the rubric
+- `.work\applied\pairs_NNN.json` / `pairs_all.json` - scraped-vs-tracker pairs
+  (company-token or exact-URL candidates, 10 per batch)
+- `.work\verify_state.json` - everything `finalize` needs
 
-### Routing and verified workbook
+Rows without a full description are marked **Needs review** immediately.
 
-After Germany/history and incomplete-review boundaries, rows route to Already
-Applied, Reposted, closed/C1+/experience exclusions, Staffing Companies, or To
+### Haiku judgment
+
+Each judge result row is `{"id", "german", "experience", "fit", "reason"}`:
+
+- `german`: `b2_plus_required` (B2/C1/C2/fluent/verhandlungssicher, standalone
+  *gute/sehr gute Deutschkenntnisse*, or *sehr gute Deutsch- und
+  Englischkenntnisse*), `a1_b1_ok`, `preferred`, `none`. The candidate is A2, so
+  required B2+ is dropped.
+- `experience`: lower bound of the required range (`minimum_0_years` ...
+  `minimum_over_2_years`); optional years do not disqualify.
+- `fit`: `good_fit`, `partial_fit`, `poor_fit` against the portfolio focus; poor
+  fits are dropped (this catches title-filter false positives such as landscaping
+  or non-food QA).
+
+Already-applied results are `{"id", "match", "reason"}`. Missing result files,
+unreadable JSON and invalid choices go to **Needs review** (jobs) or "not
+applied" (pairs); nothing is ever defaulted to a permissive answer.
+
+### Finalize and routing
+
+`finalize_verification()` merges results, then routes rows to Already Applied,
+Reposted, closed / German B2+ / experience exclusions, Staffing Companies, or To
 Apply. To Apply always exists; other sheets are created when they contain rows:
-Reposted, Staffing Companies, Already Applied, Needs Review, Previously Seen.
-The workbook keeps the `detail_language`, `detail_exp_years`,
-`detail_review_status`, `detail_reposted`, `detail_salary`, and `detail_remote`
-columns. Structural hyperlinks are checked on every sheet; HTTP sampling skips
-Previously Seen URLs.
+Reposted, Staffing Companies, Already Applied, Needs Review, Previously Seen. The
+workbook keeps the `detail_language`, `detail_exp_years`, `detail_review_status`,
+`detail_reposted`, `detail_salary`, and `detail_remote` columns. Hyperlink
+structure is checked on every sheet; HTTP sampling skips Previously Seen URLs.
 
-### Reposted LinkedIn Detection
+### Reposted LinkedIn detection
 
 Existing repost heuristics route surviving LinkedIn rows to Reposted; they do
-not override the all-history exact-URL filter. Exact historical URLs cannot be
-reintroduced into To Apply by carryover/repost handling.
+not override the all-history exact-URL filter.
 
-## Target Role Profiles
+## Candidate Profile
 
-| # | Role | Covers variants |
-|---|---|---|
-| 1 | Data Engineer | Junior, Cloud, Data Warehouse, ETL, Dateningenieur |
-| 2 | Analytics Engineer | — |
-| 3 | Data Analyst | Datenanalyst, BI Developer, BI Entwickler |
-| 4 | AI Engineer | AI Data Engineer, GenAI, Junior Data Scientist |
-| 5 | Machine Learning Engineer | — |
-| 6 | Business Analyst | — |
-| 7 | SQL Developer | Database Developer, Python Data Developer |
-| 8 | Praktikum Data | Internship Data |
-| 9 | Werkstudent Data | Working Student Data |
-| 10 | Werkstudent Business Intelligence | Working Student BI |
+Derived from the portfolio at `llm-cv\okf` (project catalog and resumes): plant
+research and experiments, hydroponics / CEA, quality control and food safety.
+Search titles are grouped as plant science, hydroponics / CEA, laboratory,
+quality and food safety, and student/intern variants; see `SEARCH_ROLES` in
+`config.py`.
 
 ## Function Reference
+
+### Config (`config.py`)
+
+| Item | Purpose |
+|---|---|
+| `SEARCH_ROLES` | Portfolio-based search titles |
+| `is_relevant_title()` | Domain-keyword title filter with software exclusions |
+| `match_score()` | Percentage of portfolio skill keywords found in a text |
+| paths / keys | `JOB_SEARCH_DIR`, `WORK_DIR`, tracker CSV, `TINYFISH_API_KEY`, `JINA_API_KEY` |
 
 ### Pipeline (`apify_job_search.py`)
 
 | Function | Purpose |
 |---|---|
-| `fetch_arbeitnow_jobs()` | Free REST API, filters by `created_at` |
-| `fetch_xing_jobs()` | Free `requests` HTML scraper |
-| `fetch_stepstone_jobs()` | Free `requests` HTML scraper |
-| `fetch_linkedin_jobs_free()` | Free HTML scraping, multi-city, 10 roles parallel, retry on 429 |
-| `fetch_indeed_jobs()` | GraphQL API, 10 roles parallel, full descriptions |
-| `fetch_wellfound_jobs()` | SSR role pages and JSON-LD description enrichment |
-| `fetch_euremotejobs_jobs()` | WordPress REST API with full descriptions |
-| `fetch_all_ats()` | Orchestrator for Greenhouse/SmartRecruiters/Ashby |
-| `check_experience_and_location()` | Title/seniority filters plus shared Germany and working-student location policy |
+| `fetch_arbeitnow_jobs()` / `fetch_xing_jobs()` / `fetch_stepstone_jobs()` | Free REST / HTML sources |
+| `fetch_linkedin_jobs_free()` | HTML scraping, multi-city, parallel titles, retry on 429 |
+| `fetch_indeed_jobs()` | GraphQL API with full descriptions |
+| `_enrich_descriptions()` | JSON-LD detail pages, then TinyFish/Jina fallback |
+| `check_experience_and_location()` | Title, seniority and Germany filters; classifies role type |
 | `normalize_key()` | Within-run company/title dedup key |
-| `load_current_run_jobs()` | Reads today's export for safe same-day preservation |
-| `main()` | Scrapes, applies all-prior exact URL dedup and location guard, then exports |
+| `main()` | Scrape, dedup (within-run, same-day, all-history URL), export |
 | `convert_csv_to_xlsx()` | openpyxl export with clickable links and autofilter |
 
-### Shared identity and location (`job_identity.py`, `location_policy.py`)
+### Fetchers (`fetchers.py`)
 
 | Function | Purpose |
 |---|---|
-| `normalize_job_url()` | Stable URL identity; LinkedIn numeric IDs and Indeed `jk` canonicalized; known tracking removed; generic path/query identity preserved |
-| `load_seen_job_urls()` | Exact URL set from every earlier dated export; raises on unreadable history |
+| `fetch_tinyfish()` | Batched TinyFish Fetch API call (markdown) |
+| `fetch_jina()` | Jina Reader fetch of one URL |
+| `fetch_job_description()` | TinyFish then Jina, accepting only real job descriptions |
+| `looks_like_job_description()` | Marker/length check that rejects login walls |
+
+### Identity and location (`job_identity.py`, `location_policy.py`)
+
+| Function | Purpose |
+|---|---|
+| `normalize_job_url()` | Stable URL identity; LinkedIn IDs and Indeed `jk` canonicalized |
+| `load_seen_job_urls()` | Exact URL set from earlier dated exports; raises on unreadable history |
 | `is_germany_location()` | Conservative Germany country/state/city evidence |
-| `is_hamburg_or_kiel()` | Exact Hamburg/Kiel token check for working-student eligibility |
 
 ### ATS (`ats_scraper.py`)
 
 | Function | Purpose |
 |---|---|
-| `fetch_greenhouse()` | Greenhouse public JSON API, `first_published` freshness |
-| `fetch_smartrecruiters()` | SmartRecruiters public JSON API, paginated, `releasedDate` |
-| `fetch_ashby()` | Ashby embedded `window.__appData` JSON, `publishedDate` |
-| `_is_fresh()` | Freshness check — returns True when date is None (false positives > false negatives) |
+| `fetch_greenhouse()` / `fetch_smartrecruiters()` / `fetch_ashby()` | Public ATS APIs with freshness filtering |
+| `_is_fresh()` | Freshness check; returns True when the date is missing |
 
 ### Verification (`verify_jobs.py`)
 
 | Function | Purpose |
 |---|---|
-| `run_verification()` | Async entry: Germany/history prefilter, platform checks, final JD judgment, routing, workbook export |
-| `llm_classify_all()` | One bounded OMP `judge_batch` call on full final descriptions; missing/failing rows become Needs Review |
-| `apply_judgment_answers()` | Validates typed choices and preserves exact experience buckets |
-| `verify_linkedin()` | LinkedIn liveness and JSON-LD description handling |
-| `verify_indeed()` | Indeed GraphQL API verification |
-| `verify_xing()` / `verify_stepstone()` | Platform-specific verification |
-| `detect_reposted()` | Existing LinkedIn repost routing; cannot bypass the all-history exact-URL filter |
-| `save_xlsx()` | To Apply plus conditional Reposted, Staffing Companies, Already Applied, Needs Review, and Previously Seen sheets |
-| `smoke_test_hyperlinks()` | Structural checks on all sheets; HTTP sampling excludes Previously Seen |
+| `prepare_verification()` | Germany/history prefilter, platform checks, description fallback, batch files |
+| `write_judge_batches()` | Writes Haiku batches; no-description rows go to Needs Review |
+| `read_judge_results()` | Merges result files; missing/invalid answers stay in review |
+| `apply_judgment_answers()` | Validates Haiku choices |
+| `finalize_verification()` | Routing and the verified workbook |
+| `detect_reposted()` | LinkedIn repost routing |
+| `save_xlsx()` / `smoke_test_hyperlinks()` | Workbook export and link checks |
 
-### Staffing Filter (`staffing_filter.py`)
+### Already-applied (`applied_check.py`)
 
 | Function | Purpose |
 |---|---|
-| `is_staffing_company()` | Checks company names against the shared staffing/recruitment blocklist |
+| `load_applied_data()` | Reads the tracker; builds company/title and URL keys |
+| `prepare_match_input()` | Writes candidate pair batches under `.work\applied` |
+| `load_llm_matches()` | Merges Haiku result files; `None` if never prepared |
+| `is_already_applied()` | Haiku matches first, deterministic URL/key fallback |
 
-### Already-Applied Detection (`applied_check.py`)
+### Staffing filter (`staffing_filter.py`)
 
-| Function | Purpose |
-|---|---|
-| `load_applied_data()` | Reads the applications tracker and builds deterministic company/title and URL keys |
-| `prepare_match_input(csv_path)` | Pre-filters scraped/tracker pairs and writes `/tmp/already_applied_input.json` for JS-side matching |
-| `load_llm_matches()` | Loads JS-classified tracker matches from `/tmp/already_applied_matches.json` |
-| `is_already_applied()` | Checks LLM match sets first, then deterministic URL/key fallback |
+`STAFFING_COMPANIES` is the shared recruiter/staffing blocklist regex.

@@ -1,38 +1,16 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 """
-Jobscraper Pipeline — 100% Free Job Fetcher, Deduplicator & Dated CSV Exporter
-Platforms: LinkedIn (free HTML), Indeed (GraphQL API), Arbeitnow, Xing, Stepstone, ATS Direct (Greenhouse/SmartRecruiters/Ashby)
-Filters: Freshness (<24h), Experience (<=2 yrs), Working Student (Hamburg & Kiel ONLY),
-         Internships (Germany-wide), Title relevance (data/analytics/AI/SQL/Python keywords)
-Output Path: /home/sagar/Skills/Jobscraper/Job Search/YYYY-MM-DD/Job_Search_<Month>_<Day>_<Year>.csv
+Jobscraper Pipeline - free job fetcher, deduplicator and dated CSV exporter.
 
-Changelog:
-  2026-08-04: Initial release. LinkedIn + Indeed + Arbeitnow + Kununu. 24 SEARCH_ROLES. ~$1.50-3.00/run.
-  2026-08-05: Cost optimization (82% reduction → ~$0.55/run). Consolidated 24 → 10 SEARCH_ROLES.
-              Fixed LinkedIn maxItems bug (was sending maxItems, actor uses count). Fixed Indeed missing
-              title param (generic garbage results). Added maxTotalChargeUsd safety caps. Dropped Kununu
-              (broken actor). Added Startup.jobs (free cloudscraper). Added is_relevant_title() post-filter.
-  2026-08-06: Added Xing (free cloudscraper, data-testid + <time dateTime>). Added Stepstone (free
-              cloudscraper, path-based URLs with ag=age_1 24h filter, data-at SSR attributes, German
-              relative time parsing via parse_stepstone_timeago()). Pipeline now 6 platforms.
-  2026-08-07: LinkedIn AI search rollout — actor autoConvertToAiSearch defaults true, softening
-              location=Germany into a natural-language hint. f_TPR=r86400 24h filter unaffected
-              (stays as URL filter under AI search). Removed dead prototype scripts
-              (stepstone_scraper.py, csv_to_xlsx.py, merge_linkedin.py). Added .gitignore, README.md, CHANGELOG.md.
-  2026-08-09b: CRITICAL FIX: Indeed's datePosted='1' parameter is IGNORED by the API (same bug as
-              Glassdoor's fromAge=1). 11/102 jobs (10.8%) were stale, including jobs 500+ days old.
-              Added post-filter on datePublished in fetch_indeed_jobs() to reject jobs older than 24h.
-              Also added defense-in-depth safety-net post-filter to fetch_linkedin_jobs() (f_TPR=r86400
-              verified working 727/727, but post-filter catches any future regressions). Date-only
-              timestamps (LinkedIn format) treated as end-of-day (23:59:59) to avoid false rejections.
-  2026-08-10: CRITICAL FIX: Stepstone switched from cloudscraper to plain requests. Stepstone is
-              behind Akamai (not Cloudflare) — cloudscraper's challenge-solving hangs on Akamai,
-              causing read timeouts on port 443. Plain requests with a browser User-Agent works
-              (Stepstone serves SSR HTML without anti-bot challenge). All data-at parsing unchanged.
-              Also switched Xing from cloudscraper to plain requests — Xing is behind AWS CloudFront
-              (not Cloudflare), so cloudscraper was unnecessary overhead with the same hang risk.
+Candidate: Bhagya Lekshmi Vikraman Nair (plant science / hydroponics / food safety).
+Platforms: LinkedIn (free HTML), Indeed (GraphQL), Arbeitnow, Xing, Stepstone,
+           ATS Direct (Greenhouse / SmartRecruiters / Ashby).
+Filters:   freshness (<24h), experience (<=2 yrs), Germany-wide for every role type
+           (full-time, working student, internship), portfolio title relevance.
+Output:    <JOB_SEARCH_DIR>/YYYY-MM-DD/Job_Search_<Month>_<Day>_<Year>.csv
 
-See CHANGELOG.md for full version history and apify_job_search.md for detailed technical documentation.
+Runs on Windows under Claude Desktop. Search titles, filters and paths live in
+config.py. See CHANGELOG.md for history and ARCHITECTURE.md for technical details.
 """
 
 import os
@@ -48,73 +26,25 @@ import requests
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from tqdm import tqdm
-from job_identity import load_seen_job_urls, normalize_job_url
-from location_policy import is_germany_location, is_hamburg_or_kiel
 
-# Paths
-BASE_RESUMES_DIR = Path("/home/sagar/Documents/YAML-CV/skills/okf-cv/okf/base_files")
-PORTFOLIO_DIR = Path("/home/sagar/Documents/YAML-CV/skills/okf-cv/okf/portfolio")
-JOB_SEARCH_DIR = Path("/home/sagar/Skills/Jobscraper/Job Search")
+from config import (  # also forces a UTF-8 console on Windows
+    BASE_RESUMES_DIR,
+    EXCLUDED_TITLE_PATTERNS,
+    FRESHNESS_HOURS,
+    JOB_SEARCH_DIR,
+    MAX_EXP_YEARS,
+    PORTFOLIO_DIR,
+    SEARCH_ROLES,
+    WINDOWS_USER_AGENT,
+    is_relevant_title,
+    match_score as _config_match_score,
+)
+from fetchers import fetch_job_description
+from job_identity import load_seen_job_urls, normalize_job_url
+from location_policy import is_germany_location
 
 # Ensure Output Directory Exists
 JOB_SEARCH_DIR.mkdir(parents=True, exist_ok=True)
-
-# Search Parameters
-# Consolidated from 24 → 10 core roles.
-# LinkedIn/Indeed/Kununu search engines cover variants (Junior, Cloud, etc.) automatically.
-# German terms kept where they produce distinct results not covered by English equivalents.
-SEARCH_ROLES = [
-    # Core Data Engineering (covers Junior, Cloud, Data Warehouse, ETL, Dateningenieur)
-    "Data Engineer",
-    "Analytics Engineer",
-    # Business Intelligence & Analytics (covers Datenanalyst, BI Developer, BI Entwickler)
-    "Data Analyst",
-    # AI & Data Science (covers AI Data Engineer, GenAI, Junior Data Scientist)
-    "AI Engineer",
-    "Machine Learning Engineer",
-    # Business / Quantitative Analytics
-    "Business Analyst",
-    # Database & Systems (covers Database Developer, Python Data Developer)
-    "SQL Developer",
-    # Internships & Working Student (distinct result sets)
-    "Praktikum Data",
-    "Werkstudent Data",
-    "Werkstudent Business Intelligence",
-]
-
-MAX_EXP_YEARS = 2
-FRESHNESS_HOURS = 24
-
-
-# Seniority Filter Regex
-EXCLUDED_TITLE_PATTERNS = re.compile(
-    r"\b(senior|sr|lead|head|principal|staff|manager|director|architect|vp|chief|expert|team lead)\b",
-    re.IGNORECASE
-)
-
-
-
-# Core Tech Stack Keywords for Match Scoring
-TECH_KEYWORDS = ["dbt", "airflow", "spark", "pyspark", "python", "sql", "gcp", "bigquery", "aws", "azure", "databricks", "docker", "kafka", "postgresql", "snowflake"]
-
-# Core domain keywords that MUST appear in the job title for it to be relevant.
-# This is a universal post-filter applied to ALL platforms (LinkedIn, Indeed, Arbeitnow).
-# Without this, actors return garbage: "Nachtwächter" for "Data Engineer" search, etc.
-DOMAIN_TITLE_KEYWORDS = re.compile(
-    r"\b(data|daten\w*|analytics|analyst\w*|ai|artificial intelligence|"
-    r"bi|business intelligence|sql|python|database|datenbank\w*|"
-    r"machine learning|ml|deep learning|etl|pipeline|warehouse|"
-    r"datapipeline|dataops|mlops|llm|genai)\b",
-    re.IGNORECASE
-)
-
-
-def is_relevant_title(title: str) -> bool:
-    """Check if the job title contains at least one core data/analytics/AI keyword.
-    This catches false positives from all actors (Indeed returns 'Nachtwächter' for
-    'Data Engineer' searches, LinkedIn returns 'Junior Software Engineer', etc.).
-    """
-    return bool(DOMAIN_TITLE_KEYWORDS.search(title))
 
 
 def detect_language(text: str) -> str:
@@ -131,7 +61,7 @@ def detect_language(text: str) -> str:
 def classify_role_type(title: str, description: str) -> str:
     """Classify into Working Student, Internship, or Full-Time / Entry Level."""
     combined = f"{title} {description}".lower()
-    if re.search(r"\b(werkstudent|werkstudentin|working student)\b", combined):
+    if re.search(r"\b(werkstudent|werkstudentin|working student|student assistant|studentische hilfskraft)\b", combined):
         return "Working Student"
     elif re.search(r"\b(intern|internship|praktikum|praktikant|praktikantin)\b", combined):
         return "Internship"
@@ -139,9 +69,9 @@ def classify_role_type(title: str, description: str) -> str:
         return "Full-Time / Entry-Level"
 
 def check_experience_and_location(title: str, description: str, location: str) -> tuple[bool, str]:
-    """Validate title, seniority, Germany eligibility, and working-student cities."""
+    """Validate title relevance, seniority and Germany eligibility (Germany-wide, all role types)."""
     if not is_relevant_title(title):
-        return False, "Title not relevant to data/analytics/AI"
+        return False, "Title not relevant to plant science / food safety / lab roles"
 
     if EXCLUDED_TITLE_PATTERNS.search(title):
         return False, "Seniority title excluded"
@@ -149,17 +79,11 @@ def check_experience_and_location(title: str, description: str, location: str) -
     if not is_germany_location(location):
         return False, f"Location outside or unknown for Germany ({location})"
 
-    role_type = classify_role_type(title, description)
-    if role_type == "Working Student" and not is_hamburg_or_kiel(location):
-        return False, f"Working student outside Hamburg/Kiel ({location})"
-
-    return True, role_type
+    return True, classify_role_type(title, description)
 
 def compute_match_score(text: str) -> int:
-    """Calculate percentage match score against Sagar's core tech stack."""
-    text_lower = text.lower()
-    matches = sum(1 for kw in TECH_KEYWORDS if kw in text_lower)
-    return min(100, int((matches / len(TECH_KEYWORDS)) * 100 * 2.5))  # Normalized score
+    """Percentage match against the candidate's portfolio skill keywords."""
+    return _config_match_score(text)
 
 def _norm_company(c: str) -> str:
     c = (c or "").lower().strip()
@@ -330,10 +254,6 @@ def _enrich_descriptions(jobs: list[dict], platform: str, max_workers: int = 5) 
             "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7",
             "Referer": "https://www.stepstone.de/",
         },
-        "Wellfound": {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept-Language": "en-US,en;q=0.9",
-        },
     }
     headers = PLATFORM_HEADERS.get(platform, {})
     if not headers:
@@ -354,6 +274,8 @@ def _enrich_descriptions(jobs: list[dict], platform: str, max_workers: int = 5) 
         if not url:
             return idx, ""
         desc = _fetch_jsonld_description(url, headers)
+        if not desc:
+            desc = fetch_job_description(url)  # TinyFish, then Jina Reader
         time.sleep(random.uniform(0.3, 0.8))  # jittered polite delay
         return idx, desc
 
@@ -442,7 +364,7 @@ def _parse_xing_card(card, cutoff, seen_urls):
     }
 
 def fetch_xing_jobs():
-    """Fetch jobs from Xing.com via HTML scraping (free, no Apify).
+    """Fetch jobs from Xing.com via HTML scraping (free).
     Uses plain requests — Xing is behind AWS CloudFront (not Cloudflare), so
     no anti-bot bypass needed. Fetches search result pages for each SEARCH_ROLE
     and parses job listings from server-rendered HTML. Relies on data-testid
@@ -460,7 +382,7 @@ def fetch_xing_jobs():
     cutoff = now - timedelta(hours=FRESHNESS_HOURS)
     session = requests.Session()
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
     })
     seen_urls = set()
@@ -535,7 +457,8 @@ def _parse_stepstone_card(card, cutoff, now):
     data-at attributes, enforces 24h freshness, and applies title/experience/location filters.
     """
     # URL — href on the job-item-title link
-    url_m = re.search(r'href="(/stellenangebote--[^"]+)"', card)
+    # (Stepstone now emits absolute hrefs; accept both forms.)
+    url_m = re.search(r'href="(?:https://www\.stepstone\.de)?(/stellenangebote--[^"]+)"', card)
     if not url_m:
         return None
     job_url = url_m.group(1)
@@ -600,7 +523,7 @@ def _parse_stepstone_card(card, cutoff, now):
         "description": desc
     }
 def fetch_stepstone_jobs():
-    """Fetch jobs from Stepstone.de via HTML scraping (free, no Apify).
+    """Fetch jobs from Stepstone.de via HTML scraping (free).
     Uses plain requests to fetch server-side rendered search result pages.
     Stepstone is behind Akamai (not Cloudflare), so cloudscraper's challenge-
     solving hangs and causes read timeouts on port 443. Plain requests with a
@@ -621,7 +544,7 @@ def fetch_stepstone_jobs():
     cutoff = now - timedelta(hours=FRESHNESS_HOURS)
     session = requests.Session()
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
     })
     seen_urls = set()
@@ -662,7 +585,7 @@ def fetch_stepstone_jobs():
             page_fresh = 0
             for card in job_cards:
                 # URL dedup — extract path for seen_urls check before parsing
-                url_m = re.search(r'href="(/stellenangebote--[^"]+)"', card)
+                url_m = re.search(r'href="(?:https://www\.stepstone\.de)?(/stellenangebote--[^"]+)"', card)
                 if not url_m:
                     continue
                 job_url = url_m.group(1)
@@ -688,7 +611,7 @@ def fetch_stepstone_jobs():
 
 
 def fetch_linkedin_jobs_free():
-    """Fetch LinkedIn jobs via free HTML scraping (no Apify, $0 cost).
+    """Fetch LinkedIn jobs via free HTML scraping ($0 cost).
     Scrapes the public LinkedIn jobs search page with f_TPR=r86400 (24h filter).
 
     Multi-city search strategy: LinkedIn caps results at 60 per page with no
@@ -852,7 +775,7 @@ def fetch_indeed_jobs():
 
     Uses the same mobile API endpoint as the Indeed iOS app
     (apis.indeed.com/graphql) with a hardcoded API key. No Cloudflare,
-    no auth, no Apify — completely free. Returns full job descriptions.
+    no auth, completely free. Returns full job descriptions.
 
     The API's dateOnIndeed filter enforces 24h freshness server-side.
     Post-filters on datePublished as a safety net.
@@ -986,234 +909,6 @@ def fetch_indeed_jobs():
     return jobs
 
 
-def _parse_wellfound_date(date_str: str, now: datetime) -> datetime | None:
-    """Convert Wellfound relative date string to datetime.
-    Examples: 'today', '2 days ago', '1 week ago', '4 weeks ago', '1 month ago'.
-    Returns None if the string can't be parsed.
-    """
-    s = date_str.strip().lower()
-    if s == "today":
-        return now
-    m = re.match(r"(\d+)\s+(day|week|month)s?\s+ago", s)
-    if m:
-        n, unit = int(m.group(1)), m.group(2)
-        if unit == "day":
-            return now - timedelta(days=n)
-        elif unit == "week":
-            return now - timedelta(weeks=n)
-        elif unit == "month":
-            return now - timedelta(days=n * 30)
-    return None
-
-
-def fetch_wellfound_jobs():
-    """Fetch jobs from Wellfound (formerly AngelList) via free HTML scraping.
-
-    Wellfound's /role/l/{role}/germany pages render SSR job cards with title,
-    company (from logo alt text), location, and relative posted date.
-    Job detail pages have JSON-LD JobPosting schema with full descriptions.
-    No auth, no Cloudflare on role/detail pages — completely free.
-    """
-    from bs4 import BeautifulSoup
-
-    WELLFOUND_ROLES = [
-        "data-engineer",
-        "analytics-engineer",
-        "data-analyst",
-        "ai-engineer",
-        "machine-learning-engineer",
-        "data-scientist",
-    ]
-    BASE_URL = "https://wellfound.com/role/l"
-    HEADERS = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-
-    now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(hours=FRESHNESS_HOURS)
-
-    def fetch_role(slug):
-        role_jobs = []
-        url = f"{BASE_URL}/{slug}/germany"
-        try:
-            resp = requests.get(url, headers=HEADERS, timeout=15)
-            if resp.status_code != 200:
-                print(f"[!] Wellfound role '{slug}' returned {resp.status_code}", flush=True)
-                return role_jobs
-            soup = BeautifulSoup(resp.text, "html.parser")
-        except Exception as e:
-            print(f"[!] Wellfound error for '{slug}': {e}", flush=True)
-            return role_jobs
-
-        job_links = [a for a in soup.find_all("a", href=lambda h: h and re.match(r"/jobs/\d+-", h))]
-        for link in job_links:
-            title = link.get_text(strip=True)
-            href = link.get("href", "")
-            if not title or not href:
-                continue
-
-            # Walk up to find the card container that includes the company logo
-            container = link
-            company = ""
-            for _ in range(15):
-                container = container.parent
-                if container is None:
-                    break
-                img = container.find("img", alt=lambda a: a and "company logo" in a)
-                if img:
-                    company = img.get("alt", "").replace(" company logo", "").strip()
-                    break
-            if not company:
-                continue
-
-            # Extract card text for location and date
-            card_text = container.get_text(separator=" ", strip=True) if container else ""
-
-            # Parse relative date
-            date_match = re.search(r"(today|\d+\s+(?:day|week|month)s?\s+ago)", card_text, re.IGNORECASE)
-            date_str = date_match.group(1) if date_match else ""
-            posted_dt = _parse_wellfound_date(date_str, now)
-            if posted_dt and posted_dt < cutoff:
-                continue
-
-            # Parse location
-            loc_match = re.search(r"(Remote only|Remote|Germany|Berlin|Munich|Hamburg|Frankfurt|Cologne|Stuttgart|Düsseldorf|Karlsruhe)", card_text)
-            location = loc_match.group(1) if loc_match else ""
-
-            job_url = f"https://wellfound.com{href}"
-            is_valid, role_type_or_reason = check_experience_and_location(title, "", location)
-            if not is_valid:
-                continue
-
-            role_jobs.append({
-                "language": detect_language(title),
-                "job_board": "Wellfound",
-                "role_type": role_type_or_reason,
-                "title": title,
-                "company": company,
-                "location": location,
-                "posted_at": posted_dt.isoformat() if posted_dt else "Last 24h",
-                "exp_required": "<= 2 Years",
-                "match_score": f"{compute_match_score(title)}%",
-                "job_url": job_url,
-                "description": "",
-            })
-
-        print(f"    Wellfound '{slug}': {len(role_jobs)} jobs", flush=True)
-        return role_jobs
-
-    jobs = []
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        futures = [executor.submit(fetch_role, slug) for slug in WELLFOUND_ROLES]
-        for future in tqdm(as_completed(futures), total=len(futures), desc="Wellfound roles"):
-            try:
-                jobs.extend(future.result())
-            except Exception as e:
-                print(f"[!] Wellfound role fetch error: {e}", flush=True)
-
-    # Enrich descriptions via JSON-LD on detail pages
-    if jobs:
-        _enrich_descriptions(jobs, "Wellfound", max_workers=3)
-
-    return jobs
-
-
-def fetch_euremotejobs_jobs():
-    """Fetch jobs from EU Remote Jobs via WordPress REST API.
-
-    EU Remote Jobs (euremotejobs.com) is a WordPress + WP Job Manager site
-    with a public REST API at /wp-json/wp/v2/job-listings. Returns full job
-    descriptions in the content field — no detail page fetching needed.
-    Free, no auth, no rate limiting.
-    """
-    from bs4 import BeautifulSoup
-
-    API_URL = "https://euremotejobs.com/wp-json/wp/v2/job-listings"
-    HEADERS = {"User-Agent": "Mozilla/5.0"}
-
-    # Category IDs: Data=24, Engineering=65, IT=393
-    RELEVANT_CATEGORIES = {"job_listing_category-data", "job_listing_category-engineering", "job_listing_category-it"}
-
-    now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(hours=FRESHNESS_HOURS)
-    cutoff_iso = cutoff.strftime("%Y-%m-%dT%H:%M:%S")
-
-    jobs = []
-    page = 1
-    while True:
-        try:
-            url = f"{API_URL}?per_page=100&_embed&page={page}&after={cutoff_iso}"
-            resp = requests.get(url, headers=HEADERS, timeout=30)
-            if resp.status_code != 200:
-                print(f"[!] EU Remote Jobs API returned {resp.status_code} on page {page}", flush=True)
-                break
-            data = resp.json()
-            if not data:
-                break
-        except Exception as e:
-            print(f"[!] EU Remote Jobs API error: {e}", flush=True)
-            break
-
-        for item in data:
-            # Filter by category (Data, Engineering, IT)
-            classes = item.get("class_list", [])
-            if not any(c in RELEVANT_CATEGORIES for c in classes):
-                continue
-
-            title = item.get("title", {}).get("rendered", "")
-            if not title:
-                continue
-
-            company = item.get("meta", {}).get("_company_name", "Unknown")
-            posted_str = item.get("date", "")
-            try:
-                posted_dt = datetime.fromisoformat(posted_str).replace(tzinfo=timezone.utc)
-            except (ValueError, TypeError):
-                posted_dt = None
-            if posted_dt and posted_dt < cutoff:
-                continue
-
-            # Full JD from content field (HTML — strip tags)
-            content_html = item.get("content", {}).get("rendered", "")
-            desc = BeautifulSoup(content_html, "html.parser").get_text(separator=" ", strip=True) if content_html else ""
-
-            # Location from class_list (region taxonomy)
-            region = "Remote"
-            for c in classes:
-                if c.startswith("job_listing_region-"):
-                    region = c.replace("job_listing_region-", "").replace("-", " ").title()
-                    break
-
-            job_url = item.get("link", "")
-
-            is_valid, role_type_or_reason = check_experience_and_location(title, desc, region)
-            if not is_valid:
-                continue
-
-            jobs.append({
-                "language": detect_language(f"{title} {desc}"),
-                "job_board": "EU Remote Jobs",
-                "role_type": role_type_or_reason,
-                "title": title,
-                "company": company,
-                "location": region,
-                "posted_at": posted_dt.isoformat() if posted_dt else "Last 24h",
-                "exp_required": "<= 2 Years",
-                "match_score": f"{compute_match_score(f'{title} {desc}')}%",
-                "job_url": job_url,
-                "description": desc,
-            })
-
-        # Check if there are more pages
-        total_pages = int(resp.headers.get("X-WP-TotalPages", "1"))
-        if page >= total_pages:
-            break
-        page += 1
-
-    print(f"    EU Remote Jobs: {len(jobs)} jobs (Data/Engineering/IT, last 24h)", flush=True)
-    return jobs
-
 def _style_xlsx_header(ws, header_fill, header_font, center):
     """Apply fill, font, and center alignment to the header row."""
     for c in ws[1]:
@@ -1288,14 +983,10 @@ def convert_csv_to_xlsx(csv_path: Path, xlsx_path: Path) -> None:
     print(f"[✓] XLSX exported to: {xlsx_path}")
 
 def main():
-    print("=== Jobscraper Pipeline (100% Free, No Apify) ===")
-    print(f"    LinkedIn: FREE HTML scraping ($0, 10 roles × 6 locations parallel)")
-    print(f"    Indeed: GraphQL API ($0, 10 roles parallel, full descriptions)")
-    print(f"    Xing/Stepstone: free HTML scraping (parallel)")
-    print(f"    Wellfound: startup jobs via SSR role pages + JSON-LD detail pages")
-    print(f"    EU Remote Jobs: WordPress REST API (full descriptions, no detail fetch)")
-    print(f"    ATS Direct: Greenhouse/SmartRecruiters/Ashby (free public APIs)")
-    print(f"    All 8 platforms run in parallel via ThreadPoolExecutor")
+    print("=== Jobscraper Pipeline (free sources, Windows / Claude Desktop) ===")
+    print(f"    {len(SEARCH_ROLES)} portfolio-based search titles; Germany-wide for all role types")
+    print("    LinkedIn / Indeed / Arbeitnow / Xing / Stepstone / ATS Direct in parallel")
+    print("    Missing job descriptions fall back to TinyFish, then Jina Reader")
 
     from ats_scraper import fetch_all_ats
 
@@ -1309,8 +1000,6 @@ def main():
         ("Stepstone",      fetch_stepstone_jobs),
         ("LinkedIn",       fetch_linkedin_jobs_free),
         ("Indeed",         fetch_indeed_jobs),
-        ("Wellfound",      fetch_wellfound_jobs),
-        ("EU Remote Jobs", fetch_euremotejobs_jobs),
         ("ATS Direct",     fetch_all_ats),
     ]
 
@@ -1366,9 +1055,7 @@ def main():
     eligible_current_jobs = []
     for job in current_jobs:
         location = job.get("location", "")
-        if (not is_germany_location(location)
-                or (job.get("role_type") == "Working Student"
-                    and not is_hamburg_or_kiel(location))):
+        if not is_germany_location(location):
             current_location_dropped += 1
             continue
         url = normalize_job_url(job.get("job_url", ""))
@@ -1389,9 +1076,7 @@ def main():
     new_jobs = []
     for job in deduped_jobs:
         location = job.get("location", "")
-        if (not is_germany_location(location)
-                or (job.get("role_type") == "Working Student"
-                    and not is_hamburg_or_kiel(location))):
+        if not is_germany_location(location):
             location_dropped += 1
             continue
         url = normalize_job_url(job.get("job_url", ""))
@@ -1417,10 +1102,9 @@ def main():
         f"skipped {same_day_duplicates} newly fetched URL duplicates."
     )
     print(
-        f"Germany-only location filter: removed {location_dropped} new and "
+        f"Germany-wide location filter: removed {location_dropped} new and "
         f"{current_location_dropped} existing rows."
     )
-    print(f"Cost: $0.00 (all platforms free — no Apify)")
 
     # Format Date String: e.g. Aug_4_2026
     date_str = now.strftime("%b_%d_%Y").replace("_0", "_")
@@ -1441,8 +1125,8 @@ def main():
 ## Constraints Summary
 - **Freshness:** Last 24 Hours
 - **Experience:** <= 2 Years (No Senior/Lead/Manager roles)
-- **Role Types:** Full-Time & Internships (Germany-wide) | Working Student (**Hamburg & Kiel ONLY**)
-- **Target Roles:** Data Engineer, Analytics Engineer, Data Analyst, AI Data Engineer
+- **Role Types:** Full-Time, Working Student and Internship (all Germany-wide)
+- **Target Roles:** Plant science, hydroponics / CEA, laboratory, food safety & quality (see config.py)
 
 | # | Language | Job Board | Role Type | Company | Job Title | Location | Match | Direct Link |
 |---|---|---|---|---|---|---|---|---|

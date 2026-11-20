@@ -2,11 +2,10 @@
 __pycache__/
 *.pyc
 
-# Output (regenerated each run)
+# Output and scratch (regenerated each run)
 Job Search/
+.work/
+*.log
 
 # Secrets
 config.json
-
-# Node.js (Playwright Indeed fallback)
-node_modules/

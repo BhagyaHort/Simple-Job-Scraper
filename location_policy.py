@@ -277,26 +277,3 @@ def is_germany_location(location: str) -> bool:
     if any(_has_positive_country_evidence(part) for part in segments):
         return True
     return any(_is_german_city_segment(part) for part in segments)
-
-
-_NEGATED_WORKING_CITY = re.compile(
-    r"\b(?:no|not|outside|except|excluding|exclude|unavailable\s+in|"
-    r"ineligible\s+in|not\s+(?:available|eligible|open|included|supported)\s+in)"
-    r"(?:\s+[a-z0-9]+){0,3}\s+(?:hamburg|kiel)\b|"
-    r"\b(?:hamburg|kiel)\b(?:\s+[a-z0-9]+){0,3}\s+"
-    r"(?:excluded|unavailable|ineligible|not\s+(?:available|eligible|open|included|supported))\b"
-)
-_WORKING_CITY = re.compile(r"(?<![a-z0-9])(?:hamburg|kiel)(?![a-z0-9])")
-
-
-def is_hamburg_or_kiel(location: str) -> bool:
-    """Return true for a positive Hamburg or Kiel location token, not Kielce."""
-    if not isinstance(location, str) or not location.strip():
-        return False
-    for segment in _LOCATION_SPLIT.split(location):
-        folded = _fold(segment)
-        if _NEGATED_WORKING_CITY.search(folded):
-            continue
-        if _WORKING_CITY.search(folded):
-            return True
-    return False

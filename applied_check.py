@@ -1,39 +1,36 @@
 #!/usr/bin/env python3
 """
-applied_check.py — Already-Applied Job Detection (LLM-based)
-=============================================================
+applied_check.py - Already-Applied Job Detection (Haiku-judged)
+================================================================
 
-Reads the applications tracker CSV and today's scraped jobs CSV,
-pre-filters candidate pairs by company token overlap, and uses
-LLM classification (smol model via JS eval) to detect jobs already
-applied to. Used by verify_jobs.py to segregate already-applied
-jobs into a separate "Already Applied" sheet.
+Reads the applications tracker CSV and the scraped jobs CSV, pre-filters
+candidate pairs by company-token / URL overlap, and has Claude Haiku subagents
+decide which pairs are the same company and role. verify_jobs.py uses the
+result to move already-applied jobs to a separate sheet.
 
-Pipeline:
-  1. prepare_match_input(csv_path) — pre-filters candidate pairs,
-     saves to /tmp/already_applied_input.json
-  2. JS eval — LLM classifies pairs in batches of 10, saves matched
-     scraped jobs to /tmp/already_applied_matches.json
-  3. load_llm_matches() — loads matched URLs+keys into a dict
-  4. is_already_applied() — checks URL/key against LLM matches
-     (falls back to deterministic URL+key match if LLM unavailable)
+Flow (all files live under WORK_DIR/applied):
+  1. prepare_match_input(csv_path) writes pairs_NNN.json batches (10 pairs each)
+     plus pairs_all.json.
+  2. SKILL.md has Claude Desktop launch one Haiku subagent per batch; each writes
+     result_NNN.json: [{"id": 1, "match": true, "reason": "..."}, ...]
+  3. load_llm_matches() merges the result files into URL / key sets.
+  4. is_already_applied() checks them (falls back to deterministic URL + key
+     matching when no pairs file exists).
 
-Source:
-  /home/sagar/Documents/applications_tracker.csv
-  Columns: Date, Company, Position, Source URL, ...
-  (Company + Position + Source URL used for matching)
+Tracker: config.APPLICATIONS_TRACKER_CSV (columns: Company, Position, Source URL).
 """
 
 import csv
 import json
 import re
-import sys
 from pathlib import Path
 from tqdm import tqdm
 
-APPLICATIONS_TRACKER_CSV = Path("/home/sagar/Documents/applications_tracker.csv")
-LLM_INPUT_PATH = "/tmp/already_applied_input.json"
-LLM_MATCHES_PATH = "/tmp/already_applied_matches.json"
+from config import APPLICATIONS_TRACKER_CSV, WORK_DIR, reset_dir
+
+APPLIED_DIR = WORK_DIR / "applied"
+PAIRS_ALL_PATH = APPLIED_DIR / "pairs_all.json"
+PAIRS_PER_BATCH = 10
 
 # Stopwords for company token pre-filtering (legal suffixes + generic words).
 # These are stripped before token matching to avoid false candidate pairs
@@ -48,25 +45,12 @@ _COMPANY_STOPWORDS = {
 }
 
 
-# ── Module-level import cache ────────────────────────────────────────────────
-_apify = None
-
+# ── Lazy import of normalization helpers (avoids a circular import) ─────────
 
 def _get_apify():
-    """Lazy-import normalization helpers from apify_job_search."""
-    global _apify
-    if _apify is None:
-        skill_dir = Path("/home/sagar/Skills/Jobscraper")
-        if str(skill_dir) not in sys.path:
-            sys.path.insert(0, str(skill_dir))
-        from apify_job_search import (
-            normalize_key,
-            _norm_company,
-            _norm_title,
-            normalize_job_url,
-        )
-        _apify = (normalize_key, _norm_company, _norm_title, normalize_job_url)
-    return _apify
+    from apify_job_search import normalize_key, _norm_company, _norm_title
+    from job_identity import normalize_job_url
+    return normalize_key, _norm_company, _norm_title, normalize_job_url
 
 
 def _company_tokens(name: str) -> set[str]:
@@ -96,7 +80,7 @@ def load_applied_job_keys() -> set[str]:
         print(f"[!] Already-applied detection: CSV not found at {APPLICATIONS_TRACKER_CSV}")
         return keys
 
-    with open(APPLICATIONS_TRACKER_CSV, encoding="utf-8-sig") as f:
+    with open(APPLICATIONS_TRACKER_CSV, encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
             company = (row.get("Company") or "").strip()
@@ -133,7 +117,7 @@ def load_applied_data() -> dict:
         print(f"[!] Already-applied detection: CSV not found at {APPLICATIONS_TRACKER_CSV}")
         return {"keys": keys, "companies": companies, "urls": urls, "entries": entries}
 
-    with open(APPLICATIONS_TRACKER_CSV, encoding="utf-8-sig") as f:
+    with open(APPLICATIONS_TRACKER_CSV, encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
             company = (row.get("Company") or "").strip()
@@ -161,8 +145,8 @@ def prepare_match_input(csv_path: Path) -> int:
     """Pre-filter candidate pairs between today's scraped jobs and tracker entries.
 
     Uses company token overlap (>= 1 shared meaningful token) to narrow
-    the search space, then saves candidate pairs to LLM_INPUT_PATH for
-    JS-side LLM classification.
+    the search space, then writes candidate pair batches for
+    Haiku classification.
 
     Returns the number of candidate pairs generated.
     """
@@ -221,9 +205,15 @@ def prepare_match_input(csv_path: Path) -> int:
             })
             pair_id += 1
 
-    # Save flat array for JS-side LLM classification
-    with open(LLM_INPUT_PATH, "w") as f:
-        json.dump(candidate_pairs, f)
+    # Fresh batch files for the Haiku subagents (stale results must not leak in).
+    reset_dir(APPLIED_DIR)
+    PAIRS_ALL_PATH.write_text(json.dumps(candidate_pairs, ensure_ascii=False), encoding="utf-8")
+    for batch_no, start in enumerate(range(0, len(candidate_pairs), PAIRS_PER_BATCH), 1):
+        batch_path = APPLIED_DIR / f"pairs_{batch_no:03d}.json"
+        batch_path.write_text(
+            json.dumps(candidate_pairs[start:start + PAIRS_PER_BATCH], ensure_ascii=False, indent=1),
+            encoding="utf-8",
+        )
 
     print(
         f"[*] Already-applied LLM input: {len(today_jobs)} scraped jobs × "
@@ -232,33 +222,50 @@ def prepare_match_input(csv_path: Path) -> int:
     return len(candidate_pairs)
 
 
-def load_llm_matches() -> dict | None:
-    """Load LLM-classified already-applied matches.
+def pending_pair_batches() -> list[Path]:
+    """Pair batches that do not yet have a result file."""
+    return [
+        path for path in sorted(APPLIED_DIR.glob("pairs_[0-9]*.json"))
+        if not path.with_name(path.name.replace("pairs_", "result_")).exists()
+    ]
 
-    Returns dict with "urls" (set of normalized scraped URLs) and
-    "keys" (set of normalized company::title keys), or None if the
-    matches file doesn't exist (fallback to deterministic matching).
+
+def load_llm_matches() -> dict | None:
+    """Merge Haiku result files into sets of matched scraped URLs and keys.
+
+    Returns None when prepare_match_input() never ran (callers then fall back
+    to deterministic URL/key matching). Batches without a result file are
+    treated as "no match" and reported.
     """
-    path = Path(LLM_MATCHES_PATH)
-    if not path.exists():
+    if not PAIRS_ALL_PATH.exists():
         return None
 
     normalize_key, _, _, normalize_job_url = _get_apify()
-
-    with open(path) as f:
-        data = json.load(f)
+    pairs = {pair["id"]: pair for pair in json.loads(PAIRS_ALL_PATH.read_text(encoding="utf-8"))}
 
     urls: set[str] = set()
     keys: set[str] = set()
-    for m in data:
-        nu = normalize_job_url(m.get("url", ""))
-        if nu:
-            urls.add(nu)
-        key = normalize_key(m.get("company", ""), m.get("title", ""))
-        if key:
-            keys.add(key)
+    for result_path in sorted(APPLIED_DIR.glob("result_[0-9]*.json")):
+        try:
+            results = json.loads(result_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            print(f"[!] Unreadable already-applied result {result_path.name}; ignored")
+            continue
+        for result in results if isinstance(results, list) else []:
+            pair = pairs.get(result.get("id")) if isinstance(result, dict) else None
+            if pair is None or result.get("match") is not True:
+                continue
+            nu = normalize_job_url(pair.get("scraped_url", ""))
+            if nu:
+                urls.add(nu)
+            key = normalize_key(pair.get("scraped_company", ""), pair.get("scraped_title", ""))
+            if key:
+                keys.add(key)
 
-    print(f"[*] Already-applied LLM matches: {len(urls)} URLs, {len(keys)} keys")
+    pending = pending_pair_batches()
+    if pending:
+        print(f"[!] {len(pending)} already-applied batch(es) have no result file; treated as no match")
+    print(f"[*] Already-applied Haiku matches: {len(urls)} URLs, {len(keys)} keys")
     return {"urls": urls, "keys": keys}
 
 
@@ -268,7 +275,7 @@ def is_already_applied(
 ) -> bool:
     """Check if a job has already been applied to.
 
-    Primary: LLM matches (pre-computed by JS-side LLM classification).
+    Primary: Haiku matches (pre-computed by the judge subagents).
     Checks both normalized URL and normalized company::title key against
     the LLM match sets.
 

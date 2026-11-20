@@ -1,3 +1,21 @@
+## [2026-11-20] — Windows / Claude Desktop overhaul for the plant-science portfolio
+
+### Changed
+- **Candidate and search titles** — retargeted from data/AI roles to the `llm-cv\okf` portfolio (plant science, hydroponics / CEA, laboratory, food safety and quality). 21 new `SEARCH_ROLES`, new `is_relevant_title()` with software exclusions, and portfolio-skill `match_score`. Targets full-time (entry level), working-student and internship roles.
+- **Germany-wide for every role type** — removed the Hamburg/Kiel-only working-student rule and `is_hamburg_or_kiel()`.
+- **Judge is Claude Haiku 5.5 via Claude Desktop subagents** — replaced OMP `judge_batch`/`completion()`/JS eval. `verify_jobs.py` is now `prepare` / `status` / `finalize`: prepare writes batch files, Haiku subagents (SKILL.md Step 3) write result files, finalize routes the rows. Already-applied matching uses the same file-batch flow.
+- **Portfolio fit judged by Haiku** - a third question (`good_fit` / `partial_fit` / `poor_fit`) drops title-filter false positives; new `detail_fit` column.
+- **Stepstone fixed** - Stepstone now emits absolute job hrefs; the card parser accepts both forms (it had returned 0 jobs).
+- **German rule for a German A2 candidate** — jobs that *require* German B2+ (including gute/sehr gute Deutschkenntnisse) are dropped; A1-B1 or preferred German is kept. Labels are now `German B2+ required` / `German A1/B1 OK`.
+- **Windows-only** — no `/home/...`, `/tmp` or Linux user agents; paths come from `config.py` (override with env vars); UTF-8 console forced; explicit encodings on all file I/O; PowerShell commands in the docs.
+- **ATS slugs** — replaced data/tech companies with Eurofins, Lonza and Pivot Bio (verified live).
+
+### Added
+- `config.py` (profile, titles, filters, paths, keys), `fetchers.py` (TinyFish Fetch API, then Jina Reader, as a job-description fallback in the scraper and in `verify_jobs.py prepare`).
+
+### Removed
+- Oh My Pi / OMP references and instructions, Wellfound and EU Remote Jobs fetchers (no plant-science postings), unused Node/Playwright `package.json`.
+
 ## [2026-10-07] — Germany-only eligibility, typed JD review, and exact URL history
 
 ### Changed

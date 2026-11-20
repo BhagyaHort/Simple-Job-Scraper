@@ -14,10 +14,10 @@ Each fetcher returns a list of dicts matching the pipeline's job schema:
   {language, job_board, role_type, title, company, location, posted_at,
    exp_required, match_score, job_url, description}
 
-Filters applied: title relevance (data/analytics/AI), seniority ceiling (<=2y),
+Filters applied: title relevance (plant science / lab / food safety), seniority ceiling (<=2y),
                  Germany location guard, 24h freshness, role type classification.
 
-Cost: $0 (all public APIs, no Apify, no auth).
+Cost: $0 (all public APIs, no auth).
 """
 
 import json
@@ -31,7 +31,13 @@ from urllib.parse import quote_plus
 import requests
 from bs4 import BeautifulSoup
 from tqdm import tqdm
-from location_policy import is_germany_location, is_hamburg_or_kiel
+from config import (
+    EXCLUDED_TITLE_PATTERNS,
+    WINDOWS_USER_AGENT,
+    is_relevant_title as _is_relevant_title,
+    match_score as _compute_match_score,
+)
+from location_policy import is_germany_location
 
 log = logging.getLogger("ats_scraper")
 
@@ -39,70 +45,28 @@ log = logging.getLogger("ats_scraper")
 
 FRESHNESS_HOURS = 24
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
+    "User-Agent": WINDOWS_USER_AGENT,
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-# Seniority ceiling — same as pipeline
-EXCLUDED_TITLE_PATTERNS = re.compile(
-    r"\b(senior|sr|lead|head|principal|staff|manager|director|architect|vp|chief|expert|team lead)\b",
-    re.IGNORECASE
-)
-
-
-# Title relevance — same as pipeline
-DOMAIN_TITLE_KEYWORDS = re.compile(
-    r"\b(data|daten\w*|analytics|analyst\w*|ai|artificial intelligence|"
-    r"bi|business intelligence|sql|python|database|datenbank\w*|"
-    r"machine learning|ml|deep learning|etl|pipeline|warehouse|"
-    r"datapipeline|dataops|mlops|llm|genai)\b",
-    re.IGNORECASE
-)
-
-TECH_KEYWORDS = ["dbt", "airflow", "spark", "pyspark", "python", "sql", "gcp", "bigquery",
-                 "aws", "azure", "databricks", "docker", "kafka", "postgresql", "snowflake"]
-
-
-# ── Curated German company slugs ───────────────────────────────────────────────
-# Companies with offices in Germany that hire data/analytics/AI roles.
-# Slugs verified against live APIs on 2026-08-23.
+# ── Curated company slugs ──────────────────────────────────────────────────────
+# Employers with German sites that hire plant-science, lab and food-safety staff.
+# Slugs verified against the live APIs on 2026-11-20. Add more as you find them
+# (a slug is valid when the API returns 200, even with 0 current postings).
 
 GREENHOUSE_SLUGS = [
-    "n26",            # N26 — Berlin, fintech (7 data jobs in DE)
-    "getyourguide",   # GetYourGuide — Berlin (9 data jobs in DE)
-    "contentful",     # Contentful — Berlin
-    "celonis",        # Celonis — Munich, process mining (17 data jobs in DE)
-    "dataiku",        # Dataiku — Paris/Berlin
-    "databricks",     # Databricks — Munich/remote (2 data jobs in DE)
-    "mongodb",        # MongoDB — Berlin/remote
-    "gitlab",         # GitLab — remote
-    "vercel",         # Vercel — remote EU
-    "planetscale",    # PlanetScale — remote
+    "pivotbio",       # Pivot Bio - ag-biotech (mostly US; Germany filter applies)
 ]
 
 SMARTRECRUITERS_SLUGS = [
-    "BoschGroup",     # Robert Bosch GmbH — 100+ postings (verified)
-    "DeliveryHero",   # Delivery Hero — Berlin, 100+ postings (verified)
-    "Continental",    # Continental AG — 100+ postings (verified)
-    "Thales",         # Thales Group — Düsseldorf (verified, 2 postings)
+    "Eurofins",       # Eurofins - food / environment / agro testing labs, many DE sites
+    "Lonza",          # Lonza - life-science manufacturing and QC
 ]
 
-ASHBY_SLUGS = [
-    "supabase",       # Supabase — remote EU (3 data jobs, verified)
-    "linear",         # Linear — remote (1 data job, verified)
-    "vercel",         # Vercel — remote EU
-]
+ASHBY_SLUGS: list[str] = []
 
 
 # ── Shared filter functions (mirror pipeline) ─────────────────────────────────
-
-def _is_relevant_title(title: str) -> bool:
-    return bool(DOMAIN_TITLE_KEYWORDS.search(title))
-
 
 def _detect_language(text: str) -> str:
     text_lower = text.lower()
@@ -128,7 +92,7 @@ def _classify_role_type(title: str, description: str) -> str:
 def _check_experience_and_location(title: str, description: str, location: str) -> tuple[bool, str]:
     """Apply shared title, seniority, and conservative Germany location filters."""
     if not _is_relevant_title(title):
-        return False, "Title not relevant to data/analytics/AI"
+        return False, "Title not relevant to plant science / lab / food safety"
 
     if EXCLUDED_TITLE_PATTERNS.search(title):
         return False, "Seniority title excluded"
@@ -137,16 +101,7 @@ def _check_experience_and_location(title: str, description: str, location: str) 
     if not is_germany_location(location):
         return False, f"Location outside or unknown for Germany ({location})"
 
-    if role_type == "Working Student" and not is_hamburg_or_kiel(location):
-        return False, f"Working student outside Hamburg/Kiel ({location})"
-
     return True, role_type
-
-
-def _compute_match_score(text: str) -> int:
-    text_lower = text.lower()
-    matches = sum(1 for kw in TECH_KEYWORDS if kw in text_lower)
-    return min(100, int((matches / len(TECH_KEYWORDS)) * 100 * 2.5))
 
 
 def _parse_date_flexible(date_str: str) -> Optional[datetime]:

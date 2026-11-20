@@ -1,20 +1,17 @@
 #!/usr/bin/env python3
-"""Verify scraped jobs and fail closed when typed JD judgment is incomplete.
+"""Verify scraped jobs and fail closed when Haiku JD judgment is incomplete.
 
-Full descriptions are loaded from the sibling JSON and may be enriched by the
-platform verifiers. German and experience judgments run on those final row
-descriptions through the OMP eval ``judge_batch`` API.
+Windows / Claude Desktop workflow (see SKILL.md):
+    python verify_jobs.py prepare    # platform checks, description fallback, batch files
+    (Claude Desktop launches claude-haiku-5-5 subagents on the batch files)
+    python verify_jobs.py finalize   # apply judgments, route sheets, write the workbook
 
-Usage in an OMP Python eval cell:
-    import verify_jobs
-    verify_jobs.judge_batch = judge_batch
-    await verify_jobs.run_verification(Path("Job Search/YYYY-MM-DD/Job_Search_*.csv"), force=True)
-
-The command-line entry point cannot provide ``judge_batch`` and exits with an
-explicit instruction to use OMP eval; there is no permissive standalone path.
+Full descriptions are loaded from the sibling JSON, enriched by platform
+verifiers and the TinyFish/Jina fallback, then judged by Haiku for the German
+requirement and required experience. Missing or invalid judgments go to
+"Needs Review", never to "To Apply".
 """
 import argparse
-import asyncio
 from collections import Counter
 import csv
 import json
@@ -28,8 +25,28 @@ from urllib.parse import urlparse
 import requests
 from tqdm import tqdm
 
+from applied_check import (
+    is_already_applied,
+    load_applied_data,
+    load_llm_matches,
+    pending_pair_batches,
+    prepare_match_input,
+    APPLIED_DIR,
+)
+from config import (
+    CANDIDATE_ENGLISH_LEVEL,
+    CANDIDATE_GERMAN_LEVEL,
+    JOB_SEARCH_DIR,
+    JUDGE_BATCH_SIZE,
+    MAX_EXP_YEARS,
+    WINDOWS_USER_AGENT,
+    WORK_DIR,
+    reset_dir,
+    match_score as _config_match_score,
+)
+from fetchers import fetch_jina, fetch_tinyfish, looks_like_job_description
 from job_identity import extract_linkedin_job_id, load_seen_job_urls, normalize_job_url
-from location_policy import is_germany_location, is_hamburg_or_kiel
+from location_policy import is_germany_location
 
 
 try:
@@ -43,13 +60,7 @@ except ImportError:
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-JOB_SEARCH_DIR = Path("/home/sagar/Skills/Jobscraper/Job Search")
-
-BROWSER_UA = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
-)
+BROWSER_UA = WINDOWS_USER_AGENT
 HEADERS = {
     "User-Agent": BROWSER_UA,
     "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
@@ -62,13 +73,6 @@ REQUEST_TIMEOUT = 15
 
 # Platforms that use public APIs (no HTML scraping)
 ATS_PLATFORMS = {"Greenhouse", "SmartRecruiters", "Ashby"}
-
-# Tech keywords for match score recalculation (same as pipeline)
-TECH_KEYWORDS = [
-    "dbt", "airflow", "spark", "pyspark", "python", "sql", "gcp",
-    "bigquery", "aws", "azure", "databricks", "docker", "kafka",
-    "postgresql", "snowflake",
-]
 
 # Staffing/Recruitment Agency Blocklist — imported from staffing_filter.py
 # (single source of truth shared with apify_job_search.py)
@@ -180,9 +184,7 @@ def compute_match_score_from_jd(jd_text: str) -> int:
     """
     if not jd_text:
         return 0
-    text_lower = jd_text.lower()
-    matches = sum(1 for kw in TECH_KEYWORDS if kw in text_lower)
-    return min(100, int((matches / len(TECH_KEYWORDS)) * 100 * 2.5))
+    return _config_match_score(jd_text)
 
 
 
@@ -192,7 +194,7 @@ def _find_previous_run_dirs(job_search_dir: Path, today_str: str) -> list[Path]:
     """Return previous run directories sorted by date, excluding today and non-date dirs."""
     prev_dirs = []
     for run_dir in sorted(job_search_dir.iterdir()):
-        if not run_dir.is_dir() or not run_dir.name.startswith("2026-"):
+        if not run_dir.is_dir() or not run_dir.name[:2] == "20":
             continue
         if run_dir.name >= today_str:
             continue
@@ -220,10 +222,6 @@ def _load_urls_from_csv(csv_path: Path) -> set[str]:
 
 def _load_linkedin_title_keys_from_csv(csv_path: Path) -> set[str]:
     """Return set of normalize_key(company, title) for LinkedIn rows from a CSV file."""
-    import sys
-    skill_dir = Path("/home/sagar/Skills/Jobscraper")
-    if str(skill_dir) not in sys.path:
-        sys.path.insert(0, str(skill_dir))
     from apify_job_search import normalize_key
 
     keys = set()
@@ -301,10 +299,6 @@ def detect_reposted(job: dict, today_str: str, old_title_keys: set,
             return True
 
     if not is_carryover and not is_fresh:
-        import sys
-        skill_dir = Path("/home/sagar/Skills/Jobscraper")
-        if str(skill_dir) not in sys.path:
-            sys.path.insert(0, str(skill_dir))
         from apify_job_search import normalize_key
 
         key = normalize_key(job.get("company", ""), job.get("title", ""))
@@ -312,7 +306,6 @@ def detect_reposted(job: dict, today_str: str, old_title_keys: set,
     return False
 
 # ── Already-Applied Detection (imported from applied_check.py) ────────────────
-from applied_check import load_applied_data, is_already_applied, load_llm_matches
 # ── Per-Platform Verifiers ───────────────────────────────────────────────────
 
 def _empty_result() -> dict:
@@ -645,7 +638,7 @@ INPUT_FIELDS = [
 ]
 OUTPUT_FIELDS = INPUT_FIELDS + [
     "verified_active", "detail_language", "detail_exp_years",
-    "detail_salary", "detail_remote", "detail_reposted", "detail_review_status",
+    "detail_salary", "detail_remote", "detail_reposted", "detail_fit", "detail_review_status",
 ]
 
 def find_latest_csv() -> Path | None:
@@ -875,11 +868,26 @@ def smoke_test_hyperlinks(path: Path, sample_size: int = 10) -> bool:
 
 MINIMUM_DESCRIPTION_LENGTH = 50
 
+# ── Haiku judgment (German requirement + required experience) ────────────────
+#
+# prepare writes WORK_DIR/judge/batch_NNN.json (JUDGE_BATCH_SIZE rows each) and
+# judge_instructions.md. SKILL.md has Claude Desktop launch one claude-haiku-5-5
+# subagent per batch; each writes result_NNN.json next to its batch. finalize
+# reads the results. Anything missing or invalid goes to "Needs review".
+
+JUDGE_DIR = WORK_DIR / "judge"
+STATE_PATH = WORK_DIR / "verify_state.json"
+
 _GERMAN_LABELS = {
-    "c1_plus_required": "German C1+ required",
-    "b1_b2_ok": "German B1/B2 OK",
+    "b2_plus_required": "German B2+ required",
+    "a1_b1_ok": "German A1/B1 OK",
     "preferred": "German preferred",
     "none": "",
+}
+_FIT_LABELS = {
+    "good_fit": "Good fit",
+    "partial_fit": "Partial fit",
+    "poor_fit": "Poor fit",
 }
 _EXPERIENCE_LABELS = {
     "no_requirement_or_optional": "",
@@ -889,144 +897,186 @@ _EXPERIENCE_LABELS = {
     "minimum_over_2_years": ">2",
 }
 
-JD_JUDGMENT_QUESTIONS = {
-    "german": {
-        "type": "choice",
-        "instructions": (
-            "Classify the job description's German-language requirement. Judge "
-            "whether the level is mandatory or merely preferred, not just mentioned. "
-            "C1, C2, fluent/fließend, native/Muttersprache, or verhandlungssicher "
-            "is C1+ only when required; required standalone 'sehr gute "
-            "Deutschkenntnisse' is also C1+. 'Sehr gute Deutsch- und "
-            "Englischkenntnisse' together is B1/B2 unless an explicit C1+ level is "
-            "stated. B1/B2 requirements are allowed. Preferred/nice-to-have German "
-            "is not a required C1+ condition."
-        ),
-        "criteria": {
-            "c1_plus_required": "Required C1/C2, fluent, native, verhandlungssicher, or standalone sehr gute German.",
-            "b1_b2_ok": "Required B1/B2 or the conjunctive sehr gute German-and-English convention; no required C1+.",
-            "preferred": "German is explicitly desired, preferred, advantageous, or optional, including preferred C1+.",
-            "none": "No German requirement or preference is stated.",
-        },
-    },
-    "experience": {
-        "type": "choice",
-        "instructions": (
-            "Classify minimum required professional experience using the full "
-            "description. Use the LOWER bound of a required range: 0-2 years "
-            "means minimum 0 and is eligible; 1-3 means minimum 1 and is eligible; "
-            "3-5 means minimum over 2 and is not. Distinguish required qualifications "
-            "from preferred, optional, nice-to-have, or advantageous experience; "
-            "optional 5 years does not disqualify. Required 'several years' or German "
-            "'mehrjährige Erfahrung' means over 2. Do not infer years from "
-            "senior-sounding language. If no minimum is stated (for example, "
-            "'up to 2 years'), choose no requirement."
-        ),
-        "criteria": {
-            "no_requirement_or_optional": "No required minimum, or years are only optional/preferred/desired.",
-            "minimum_0_years": "A required range explicitly has a lower bound of 0.",
-            "minimum_1_year": "The required lower bound is exactly 1 year.",
-            "minimum_2_years": "The required lower bound is exactly 2 years.",
-            "minimum_over_2_years": "The required lower bound exceeds 2 years, including required several/mehrjährige years.",
-        },
-    },
-}
+JUDGE_INSTRUCTIONS = f"""# Job description judging instructions
+
+You judge job postings for a candidate with German level {CANDIDATE_GERMAN_LEVEL} and
+English level {CANDIDATE_ENGLISH_LEVEL}, who has an M.Sc. in progress and no more than
+about two years of practical experience. Read each job's FULL description and answer
+three independent questions. Do not guess: base answers only on the text given.
+
+Candidate focus (portfolio): plant science and plant experiments, hydroponics and
+controlled-environment agriculture, microgreens, greenhouse work, laboratory
+analysis (sample preparation, extraction, isotope analysis, ImageJ), food safety
+and quality control, systematic literature review. Roles sought: full-time entry
+level, working student, internship.
+
+## Question 1 - "german": the German-language requirement
+- "b2_plus_required": German at B2 or higher is REQUIRED. This includes B2, C1, C2,
+  fluent / fliessend / verhandlungssicher / native / Muttersprache, and standalone
+  "gute Deutschkenntnisse" or "sehr gute Deutschkenntnisse". A conjunctive
+  "sehr gute Deutsch- und Englischkenntnisse" is also B2+ required.
+- "a1_b1_ok": German is required only at A1, A2 or B1, or only basic German
+  ("Grundkenntnisse", "Basiskenntnisse").
+- "preferred": German is desired, preferred, an advantage or nice-to-have at any
+  level, but not required.
+- "none": German is not mentioned.
+A posting written in German does not by itself mean German is required; judge the
+stated requirement. Required vs. preferred is what matters, not merely mentioned.
+
+## Question 2 - "experience": minimum REQUIRED professional experience
+Use the LOWER bound of a required range: 0-2 years -> minimum 0; 1-3 -> minimum 1;
+3-5 -> over 2. Optional / preferred / nice-to-have years do not count. Required
+"several years" / "mehrjaehrige Erfahrung" means over 2. Do not infer years from
+senior-sounding language. Internships, working-student and trainee roles normally
+state no requirement. Choose one of:
+- "no_requirement_or_optional"
+- "minimum_0_years"
+- "minimum_1_year"
+- "minimum_2_years"
+- "minimum_over_2_years"
+
+## Question 3 - "fit": relevance to the candidate's focus
+- "good_fit": the core work is plant science, hydroponics / CEA, horticulture,
+  plant or food laboratory work, or food safety / quality assurance of food or plants.
+- "partial_fit": adjacent (e.g. general lab assistant, agricultural technician,
+  quality assurance with some food or plant content) where the candidate's skills
+  clearly transfer.
+- "poor_fit": unrelated trade or field (landscaping labour, warehouse, software,
+  clinical / medical lab only, manufacturing QA of non-food goods, sales).
+
+## Output
+Write a JSON array (UTF-8, no markdown fences), one object per input job, in the
+same order, to the result file named in your task:
+[{{"id": "<job id from the input>", "german": "<choice>", "experience": "<choice>",
+  "fit": "<choice>", "reason": "<max 20 words, quote the deciding phrase>"}}]
+"""
 
 
 def _choice_answer(answer: object, allowed: dict[str, str], question: str) -> str:
-    if not isinstance(answer, dict):
-        raise ValueError(f"missing typed {question} answer")
-    choice = answer.get("choice")
-    if choice not in allowed:
-        raise ValueError(f"invalid typed {question} choice")
-    return choice
+    if not isinstance(answer, str) or answer not in allowed:
+        raise ValueError(f"invalid {question} choice: {answer!r}")
+    return answer
 
 
 def apply_judgment_answers(row: dict, answers: dict) -> None:
-    """Apply validated typed answers while preserving only exact year buckets."""
+    """Apply validated Haiku answers; raises ValueError on anything invalid."""
     german = _choice_answer(answers.get("german"), _GERMAN_LABELS, "German")
     experience = _choice_answer(answers.get("experience"), _EXPERIENCE_LABELS, "experience")
+    fit = _choice_answer(answers.get("fit"), _FIT_LABELS, "fit")
+    row["detail_fit"] = _FIT_LABELS[fit]
     row["detail_language"] = _GERMAN_LABELS[german]
     row["detail_exp_years"] = _EXPERIENCE_LABELS[experience]
     row["detail_review_status"] = "Reviewed"
 
 
-async def llm_classify_all(rows: list[dict]) -> None:
-    """Judge full final JD descriptions in one bounded OMP batch.
+def write_judge_batches(rows: list[dict]) -> int:
+    """Write batch files for the Haiku subagents; returns the number of batches.
 
-    Missing descriptions and per-item/API failures are marked for review and
-    never treated as a successful no-requirement answer.
+    Rows without a full description are marked "Needs review" immediately and
+    are not sent to the judge.
     """
-    if not rows:
-        return
-    for row in rows:
+    reset_dir(JUDGE_DIR)
+    (JUDGE_DIR / "judge_instructions.md").write_text(JUDGE_INSTRUCTIONS, encoding="utf-8")
+
+    items = []
+    for index, row in enumerate(rows):
         row["detail_language"] = ""
         row["detail_exp_years"] = ""
-    states: dict[str, dict[str, str]] = {}
-    for index, row in enumerate(rows):
+        row["detail_fit"] = ""
         description = row.get("description", "")
         if not isinstance(description, str) or len(description.strip()) < MINIMUM_DESCRIPTION_LENGTH:
-            row["detail_language"] = ""
-            row["detail_exp_years"] = ""
             row["detail_review_status"] = "Needs review: full job description unavailable"
             continue
-        row["detail_review_status"] = ""
-        states[str(index)] = {"description": description}
+        row["detail_review_status"] = "Needs review: judgment pending"
+        items.append({
+            "id": str(index),
+            "title": row.get("title", ""),
+            "company": row.get("company", ""),
+            "role_type": row.get("role_type", ""),
+            "description": description,
+        })
 
-    if not states:
-        print(f"[*] Typed JD judgment: 0/{len(rows)} descriptions available; all need review")
-        return
-
-    judge_batch_api = globals().get("judge_batch")
-    if not callable(judge_batch_api):
-        raise RuntimeError(
-            "OMP judge_batch is required for JD verification; inject it and await "
-            "run_verification() from an OMP Python eval cell."
+    batch_count = 0
+    for start in range(0, len(items), JUDGE_BATCH_SIZE):
+        batch_count += 1
+        path = JUDGE_DIR / f"batch_{batch_count:03d}.json"
+        path.write_text(
+            json.dumps(items[start:start + JUDGE_BATCH_SIZE], ensure_ascii=False, indent=1),
+            encoding="utf-8",
         )
+    print(f"[*] Judge input: {len(items)}/{len(rows)} descriptions in {batch_count} batch(es); "
+          f"{len(rows) - len(items)} need review (no description)")
+    return batch_count
 
-    batch = None
-    batch_error = None
-    results = {}
-    failures = {}
-    try:
-        batch = judge_batch_api(
-            states,
-            JD_JUDGMENT_QUESTIONS,
-            concurrency=16,
-            intent="Jobscraper German and experience review",
-        )
-        while batch.status()["done"] < batch.status()["total"]:
-            await batch.drain(timeout=10)
-        results = batch.results()
-        failures = batch.failed()
-    except Exception as exc:
-        batch_error = exc
-    finally:
-        if batch is not None:
-            batch.close()
 
-    for key in states:
-        row = rows[int(key)]
-        if batch_error is not None:
-            row["detail_review_status"] = "Needs review: typed judgment batch failed"
+def pending_judge_batches() -> list[Path]:
+    """Judge batches that do not yet have a result file."""
+    return [
+        path for path in sorted(JUDGE_DIR.glob("batch_[0-9]*.json"))
+        if not path.with_name(path.name.replace("batch_", "result_")).exists()
+    ]
+
+
+def read_judge_results(rows: list[dict]) -> None:
+    """Merge Haiku result files into rows. Missing/invalid answers stay in review."""
+    answers: dict[str, dict] = {}
+    for result_path in sorted(JUDGE_DIR.glob("result_[0-9]*.json")):
+        try:
+            data = json.loads(result_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            print(f"[!] Unreadable judge result {result_path.name}; its jobs need review")
             continue
-        if key in failures:
-            row["detail_review_status"] = "Needs review: typed judgment failed"
+        for entry in data if isinstance(data, list) else []:
+            if isinstance(entry, dict) and "id" in entry:
+                answers[str(entry["id"])] = entry
+
+    for index, row in enumerate(rows):
+        if row.get("detail_review_status") != "Needs review: judgment pending":
             continue
-        answers = results.get(key)
-        if not isinstance(answers, dict):
-            row["detail_review_status"] = "Needs review: typed judgment returned no result"
+        entry = answers.get(str(index))
+        if entry is None:
+            row["detail_review_status"] = "Needs review: Haiku judgment missing"
             continue
         try:
-            apply_judgment_answers(row, answers)
-        except (TypeError, ValueError):
-            row["detail_review_status"] = "Needs review: invalid typed judgment"
+            apply_judgment_answers(row, entry)
+        except ValueError:
+            row["detail_language"] = ""
+            row["detail_exp_years"] = ""
+            row["detail_review_status"] = "Needs review: invalid Haiku judgment"
 
     reviewed = sum(row.get("detail_review_status") == "Reviewed" for row in rows)
-    needs_review = len(rows) - reviewed
-    print(f"[*] Typed JD judgment: {reviewed}/{len(rows)} reviewed, {needs_review} need review")
+    print(f"[*] Haiku judgment: {reviewed}/{len(rows)} reviewed, {len(rows) - reviewed} need review")
 
-# ── Main Orchestration ───────────────────────────────────────────────────────
+
+# ── Description acquisition (TinyFish / Jina fallback) ───────────────────────
+
+def acquire_missing_descriptions(rows: list[dict]) -> None:
+    """Fill short/missing descriptions via TinyFish (batched), then Jina Reader."""
+    missing = [
+        row for row in rows
+        if row.get("job_url")
+        and len((row.get("description") or "").strip()) < MINIMUM_DESCRIPTION_LENGTH
+        and row.get("job_board") not in ATS_PLATFORMS
+    ]
+    if not missing:
+        return
+    print(f"[*] Fetching {len(missing)} missing description(s) via TinyFish, then Jina...")
+    tinyfish = fetch_tinyfish([row["job_url"] for row in missing])
+    acquired = 0
+    for row in tqdm(missing, desc="Description fallback"):
+        text = tinyfish.get(row["job_url"], "")
+        if not looks_like_job_description(text):
+            text = fetch_jina(row["job_url"])
+        if not looks_like_job_description(text):
+            continue
+        _process_result(row, text)  # sets description, salary, remote, match score
+        if not row.get("verified_active"):
+            row["verified_active"] = "True"
+        acquired += 1
+    print(f"    Acquired {acquired}/{len(missing)}")
+
+
+# ── Main orchestration: prepare -> (Haiku judges) -> finalize ────────────────
 
 def _run_date_from_path(csv_path: Path) -> date:
     try:
@@ -1035,8 +1085,11 @@ def _run_date_from_path(csv_path: Path) -> date:
         return datetime.now().date()
 
 
-async def run_verification(csv_path: Path, force: bool = False) -> None:
-    """Verify and classify only Germany-eligible, previously unseen job rows."""
+def prepare_verification(csv_path: Path, force: bool = False) -> None:
+    """Filter, platform-verify and write the judge/applied-check batches.
+
+    Saves everything finalize_verification() needs to WORK_DIR/verify_state.json.
+    """
     rows = load_csv(csv_path)
     input_count = len(rows)
     if not rows:
@@ -1050,10 +1103,7 @@ async def run_verification(csv_path: Path, force: bool = False) -> None:
     location_dropped = 0
     candidates = []
     for row in rows:
-        location = row.get("location", "")
-        if (not is_germany_location(location)
-                or (row.get("role_type") == "Working Student"
-                    and not is_hamburg_or_kiel(location))):
+        if not is_germany_location(row.get("location", "")):
             location_dropped += 1
             continue
         identity = normalize_job_url(row.get("job_url", ""))
@@ -1063,6 +1113,7 @@ async def run_verification(csv_path: Path, force: bool = False) -> None:
             continue
         candidates.append(row)
     rows = candidates
+
     # Inject source descriptions before platform verification; verifiers can
     # replace snippets with longer descriptions acquired from their APIs.
     json_path = csv_path.with_suffix(".json")
@@ -1105,7 +1156,7 @@ async def run_verification(csv_path: Path, force: bool = False) -> None:
             to_verify.append((index, row))
 
     if already_verified:
-        print(f"[*] {already_verified} row(s) already verified — skipping (use --force to re-verify)")
+        print(f"[*] {already_verified} row(s) already verified - skipping (use --force to re-verify)")
 
     platform_groups: dict[str, list[tuple[int, dict]]] = {}
     for index, row in to_verify:
@@ -1115,7 +1166,8 @@ async def run_verification(csv_path: Path, force: bool = False) -> None:
     for platform in sorted(platform_groups):
         print(f"    {platform}: {len(platform_groups[platform])} URL(s)")
 
-    print(f"\n[*] Loading cross-run history for reposted detection...")
+    print()
+    print("[*] Loading cross-run history for reposted detection...")
     old_title_keys, recent_urls = _load_repost_data(JOB_SEARCH_DIR, today_str)
     print(f"    Loaded {len(old_title_keys)} title keys from runs >{REPOST_CROSS_RUN_DAYS} days ago")
     print(f"    Loaded {len(recent_urls)} URLs from most recent previous run (carryover detection)")
@@ -1154,7 +1206,7 @@ async def run_verification(csv_path: Path, force: bool = False) -> None:
                     for local_index, result in batch_results:
                         original_index = group[local_index][0]
                         all_results[original_index] = result
-                    print(f"  [✓] {platform}: done ({len(batch_results)} verified)")
+                    print(f"  [ok] {platform}: done ({len(batch_results)} verified)")
                 except Exception as exc:
                     print(f"  [!] {platform}: batch failed ({exc})")
                     for original_index, _ in group:
@@ -1180,25 +1232,72 @@ async def run_verification(csv_path: Path, force: bool = False) -> None:
             "True" if is_repost else ("False" if row.get("job_board") == "LinkedIn" else "")
         )
 
-    await llm_classify_all(rows)
+    acquire_missing_descriptions(rows)
 
-    print(f"\n[*] Loading already-applied data...")
+    batch_count = write_judge_batches(rows)
+
+    # Tracker comparison pairs for the already-applied Haiku check.
+    pair_count = prepare_match_input(csv_path)
+
+    WORK_DIR.mkdir(parents=True, exist_ok=True)
+    state = {
+        "csv_path": str(csv_path),
+        "input_count": input_count,
+        "location_dropped": location_dropped,
+        "already_verified": already_verified,
+        "previously_seen_rows": previously_seen_rows,
+        "rows": rows,
+    }
+    STATE_PATH.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+
+    print()
+    print("=" * 60)
+    print("  Prepare complete - Haiku judging needed")
+    print("=" * 60)
+    print(f"  Judge batches:           {batch_count}   (folder: {JUDGE_DIR})")
+    print(f"  Already-applied batches: {len(list(APPLIED_DIR.glob('pairs_[0-9]*.json')))} ({pair_count} pairs)")
+    print("  Next: run the Haiku subagents from SKILL.md, then `python verify_jobs.py finalize`")
+    print("=" * 60)
+
+
+def finalize_verification() -> None:
+    """Read Haiku results, route rows to sheets and write the verified workbook."""
+    if not STATE_PATH.exists():
+        raise SystemExit("No prepared run found. Run `python verify_jobs.py prepare` first.")
+    state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    csv_path = Path(state["csv_path"])
+    rows = state["rows"]
+    previously_seen_rows = state["previously_seen_rows"]
+    input_count = state["input_count"]
+    location_dropped = state["location_dropped"]
+    already_verified = state["already_verified"]
+
+    pending = pending_judge_batches()
+    if pending:
+        print(f"[!] {len(pending)} judge batch(es) have no result file; their jobs go to Needs Review:")
+        for path in pending:
+            print(f"    {path.name}")
+    read_judge_results(rows)
+
+    print()
+    print("[*] Loading already-applied data...")
     if rows:
         applied_data = load_applied_data()
         llm_matches = load_llm_matches()
         if llm_matches is not None:
-            print("[*] Using LLM-classified already-applied matches")
+            print("[*] Using Haiku-classified already-applied matches")
         else:
-            print("[*] LLM matches not found — falling back to deterministic URL+key match")
+            print("[*] Haiku matches not found - falling back to deterministic URL+key match")
     else:
         applied_data = {}
         llm_matches = None
+
     main_rows = []
     reposted_rows = []
     staffing_rows = []
     already_applied_rows = []
     review_rows = []
-    closed_count = german_dropped = staffing_count = exp_dropped = 0
+    closed_count = german_dropped = staffing_count = exp_dropped = irrelevant_dropped = 0
     reposted_count = already_applied_count = enriched_count = 0
 
     for row in rows:
@@ -1227,7 +1326,10 @@ async def run_verification(csv_path: Path, force: bool = False) -> None:
         if active == "False":
             closed_count += 1
             continue
-        if lang == "German C1+ required":
+        if row.get("detail_fit") == "Poor fit":
+            irrelevant_dropped += 1
+            continue
+        if lang == "German B2+ required":
             german_dropped += 1
             continue
         if exp_str == ">2":
@@ -1235,7 +1337,7 @@ async def run_verification(csv_path: Path, force: bool = False) -> None:
             continue
         if exp_str:
             try:
-                if int(exp_str) > 2:
+                if int(exp_str) > MAX_EXP_YEARS:
                     exp_dropped += 1
                     continue
             except (ValueError, TypeError):
@@ -1249,7 +1351,7 @@ async def run_verification(csv_path: Path, force: bool = False) -> None:
 
         main_rows.append(row)
         if (row.get("detail_exp_years") or row.get("detail_salary")
-                or row.get("detail_remote") or lang in ("German preferred", "German B1/B2 OK")):
+                or row.get("detail_remote") or lang in ("German preferred", "German A1/B1 OK")):
             enriched_count += 1
 
     stem = csv_path.stem
@@ -1268,7 +1370,8 @@ async def run_verification(csv_path: Path, force: bool = False) -> None:
         review_rows,
         previously_seen_rows,
     )
-    print(f"\n[*] Running hyperlink smoke test on {out_path.name}...")
+    print()
+    print(f"[*] Running hyperlink smoke test on {out_path.name}...")
     smoke_test_hyperlinks(out_path)
 
     print()
@@ -1284,8 +1387,9 @@ async def run_verification(csv_path: Path, force: bool = False) -> None:
     print(f"  Needs Review:         {len(review_rows)}")
     print(f"  Excluded by location: {location_dropped}")
     print(f"  Closed/removed:       {closed_count}")
-    print(f"  Dropped (German C1+): {german_dropped}")
-    print(f"  Dropped (exp > 2y):   {exp_dropped}")
+    print(f"  Dropped (poor fit):   {irrelevant_dropped}")
+    print(f"  Dropped (German B2+): {german_dropped}")
+    print(f"  Dropped (exp > {MAX_EXP_YEARS}y):   {exp_dropped}")
     print(f"  Enriched:             {enriched_count}")
     if already_verified:
         print(f"  Already verified:     {already_verified}")
@@ -1293,36 +1397,39 @@ async def run_verification(csv_path: Path, force: bool = False) -> None:
     print("=" * 60)
 
 
-async def main():
+def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Verify jobs via OMP typed JD judgment and platform checks."
+        description="Verify scraped jobs: `prepare` (platform checks + Haiku batches), "
+                    "then `finalize` (apply Haiku judgments, write workbook)."
     )
-    parser.add_argument(
-        "--csv", type=str, default=None,
-        help="Path to input Job_Search_*.csv (default: auto-find most recent)",
-    )
-    parser.add_argument(
-        "--force", action="store_true",
-        help="Re-verify all rows, even those already verified",
-    )
+    sub = parser.add_subparsers(dest="command", required=True)
+    prep = sub.add_parser("prepare", help="Filter, verify and write Haiku batch files")
+    prep.add_argument("--csv", type=str, default=None,
+                      help="Path to input Job_Search_*.csv (default: most recent)")
+    prep.add_argument("--force", action="store_true",
+                      help="Re-verify all rows, even those already verified")
+    sub.add_parser("status", help="Show which Haiku batches still lack results")
+    sub.add_parser("finalize", help="Apply Haiku judgments and write the verified workbook")
     args = parser.parse_args()
 
-    if args.csv:
-        csv_path = Path(args.csv)
-        if not csv_path.exists():
-            print(f"[!] CSV not found: {csv_path}")
-            return
+    if args.command == "prepare":
+        if args.csv:
+            csv_path = Path(args.csv)
+            if not csv_path.exists():
+                raise SystemExit(f"CSV not found: {csv_path}")
+        else:
+            csv_path = find_latest_csv()
+            if csv_path is None:
+                raise SystemExit(f"No Job_Search_*.csv found under {JOB_SEARCH_DIR}")
+        prepare_verification(csv_path, force=args.force)
+    elif args.command == "status":
+        judge_pending = pending_judge_batches()
+        applied_pending = pending_pair_batches()
+        print(f"Judge batches without results:           {[p.name for p in judge_pending]}")
+        print(f"Already-applied batches without results: {[p.name for p in applied_pending]}")
     else:
-        csv_path = find_latest_csv()
-        if csv_path is None:
-            print(f"[!] No Job_Search_*.csv found under {JOB_SEARCH_DIR}")
-            return
-
-    await run_verification(csv_path, force=args.force)
+        finalize_verification()
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except RuntimeError as exc:
-        raise SystemExit(str(exc))
+    main()
